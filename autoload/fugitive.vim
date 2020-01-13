@@ -427,9 +427,7 @@ function! fugitive#PrepareDirEnvArgv(...) abort
   return [dir, env, cmd]
 endfunction
 
-function! s:BuildShell(dir, env, args) abort
-  let cmd = copy(a:args)
-  let tree = s:Tree(a:dir)
+function! s:BuildEnvPrefix(env) abort
   let pre = ''
   for [var, val] in items(a:env)
     if s:winshell()
@@ -438,6 +436,13 @@ function! s:BuildShell(dir, env, args) abort
       let pre = (len(pre) ? pre : 'env ') . var . '=' . s:shellesc(val) . ' '
     endif
   endfor
+  return pre
+endfunction
+
+function! s:BuildShell(dir, env, args) abort
+  let cmd = copy(a:args)
+  let tree = s:Tree(a:dir)
+  let pre = s:BuildEnvPrefix(a:env)
   if empty(tree) || index(cmd, '--') == len(cmd) - 1
     call insert(cmd, '--git-dir=' . FugitiveGitPath(a:dir))
   elseif fugitive#GitVersion(1, 8, 5)
@@ -2173,7 +2178,12 @@ augroup END
 
 " Section: :Git
 
+function! s:JobSupported() abort
+  return exists('*job_start') || exists('*jobstart')
+endfunction
+
 function! s:JobReceive(state, job, data, ...) abort
+  call add(a:state.log, a:data)
   let data = type(a:data) == type([]) ? join(a:data, "\n") : a:data
   if has_key(a:state, 'buffer')
     let data = remove(a:state, 'buffer') . data
@@ -2191,22 +2201,30 @@ function! s:JobReceive(state, job, data, ...) abort
   endif
 endfunction
 
+function! s:JobSend(job, char) abort
+  if type(a:job) == type(0)
+    call chansend(a:job, a:char)
+  else
+    call ch_sendraw(a:job, a:char)
+  endif
+endfunction
+
 if !exists('s:edit_jobs')
   let s:edit_jobs = {}
 endif
 function! s:JobWait(state, job) abort
-  while !has_key(a:state, 'file') && ch_status(a:job) !=# 'closed'
+  while !has_key(a:state, 'file') && (type(a:job) == type(0) ? jobwait([a:job], 0)[0] == -1 : ch_status(a:job) !=# 'closed')
     sleep 1m
     if getchar(1) > 0
       let c = getchar()
-      call ch_sendraw(a:job, type(c) == type(0) ? nr2char(c) : c)
+      call s:JobSend(a:job, type(c) == type(0) ? nr2char(c) : c)
     endif
   endwhile
   if has_key(a:state, 'file')
-    echo
     exe 'split' s:fnameescape(remove(a:state, 'file'))
     set bufhidden=delete
     let s:edit_jobs[bufnr('')] = [a:state, a:job]
+  else
   endif
   call fugitive#ReloadStatus(a:state.dir, 1)
   return ''
@@ -2224,7 +2242,7 @@ endfunction
 
 function! s:JobBufDelete(bufnr) abort
   if has_key(s:edit_jobs, a:bufnr) |
-    call ch_sendraw(s:edit_jobs[a:bufnr][1], "0\n")
+    call s:JobSend(s:edit_jobs[a:bufnr][1], "0\n")
     call add(s:resume_queue, remove(s:edit_jobs, a:bufnr))
     call feedkeys(":call fugitive#Resume()|checktime\r", 'n')
   endif
@@ -2235,7 +2253,7 @@ augroup fugitive_job
   autocmd BufDelete * call s:JobBufDelete(expand('<abuf>'))
   autocmd VimLeave *
         \ for s:jobbuf in keys(s:edit_jobs) |
-        \   call ch_sendraw(remove(s:edit_jobs, s:jobbuf)[1], "1\n") |
+        \   call s:JobSend(remove(s:edit_jobs, s:jobbuf)[1], "1\n") |
         \ endfor
 augroup END
 
@@ -2253,7 +2271,7 @@ function! fugitive#Command(line1, line2, range, bang, mods, arg) abort
     call extend(args, split(alias, '\s\+'), 'keep')
   endif
   let name = substitute(args[0], '\%(^\|-\)\(\l\)', '\u\1', 'g')
-  if exists('*s:' . name . 'Subcommand') && get(args, 1, '') !=# '--help' && (!exists('*job_start') || name !~# '^\%(Rebase\|Merge\|Pull\|Commit\|Revert\)$')
+  if exists('*s:' . name . 'Subcommand') && get(args, 1, '') !=# '--help' && (!s:JobSupported() || name !~# '^\%(Rebase\|Merge\|Pull\|Commit\|Revert\)$')
     try
       exe s:DirCheck(dir)
       let opts = s:{name}Subcommand(a:line1, a:line2, a:range, a:bang, a:mods, args[1:-1])
@@ -2284,17 +2302,44 @@ function! fugitive#Command(line1, line2, range, bang, mods, arg) abort
       return 'exe ' . string(mods . 'terminal ' . (a:line2 ? '' : '++curwin ') . join(map(s:UserCommandList(dir) + args, 's:fnameescape(v:val)'))) . assign . after
     endif
   endif
-  if exists('*job_start')
+  if s:JobSupported()
     let editor = 'sh ' . s:TempScript('printf "\033]51;split %s\007" "$*"', 'exit $(head -1)')
-    let [_, env, argv] = fugitive#PrepareDirEnvArgv([dir, '-c', 'core.editor=' . editor, '-c', 'sequence.editor=' . editor])
-    let state = {'dir': dir, 'mods': s:Mods(a:mods)}
+    let env = extend({'GIT_EDITOR': editor, 'GIT_SEQUENCE_EDITOR': editor}, get(opts, 'env', {}))
+    if has('patch-8.0.0902')
+      let jobcmd = s:UserCommandList(dir) + args
+    elseif has('win32')
+      let jobcmd = s:BuildEnvPrefix(env) . s:UserCommand(dir, args)
+      let env = {}
+    elseif s:executable('env')
+      let jobcmd = ['env']
+      for [envk, envv] in items(env)
+        call add(jobcmd, envk . '=' . envv)
+      endfor
+      let env = {}
+      call extend(jobcmd, s:UserCommandList(dir) + args)
+    else
+      return 'echoerr ' . string('fugitive: "env" command missing')
+    endif
+    let state = {'dir': dir, 'mods': s:Mods(a:mods), 'log': []}
+    let g:fugitive_last_job = state
     if &autowrite || &autowriteall | silent! wall | endif
-    let job = job_start(s:UserCommandList(dir) + argv + args, {
-          \ 'mode': 'raw',
-          \ 'env': env,
-          \ 'out_cb': function('s:JobReceive', [state]),
-          \ 'err_cb': function('s:JobReceive', [state]),
-          \ })
+    if exists('*job_start')
+      let jobopts = {
+            \ 'mode': 'raw',
+            \ 'out_cb': function('s:JobReceive', [state]),
+            \ 'err_cb': function('s:JobReceive', [state]),
+            \ }
+      if len(env)
+        let jobopts.env = env
+      endif
+      let job = job_start(jobcmd, jobopts)
+    else
+      let job = jobstart(jobcmd, {
+            \ 'on_stdout': function('s:JobReceive', [state]),
+            \ 'on_stderr': function('s:JobReceive', [state]),
+            \ })
+    endif
+    let state.job = job
     call s:JobWait(state, job)
     return 'checktime' . after
   else
