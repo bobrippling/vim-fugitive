@@ -590,6 +590,13 @@ Global maps can be disabled with the g:fugitive_no_maps option.
 >
         let g:fugitive_no_maps = 1
 <
+
+                                                *g:fugitive_diff_context*
+Diff context displayed in |:Gshow| can be controlled by setting the
+g:fugitive_diff_context option.
+>
+        let g:fugitive_diff_context = 20
+<
 SPECIFYING OBJECTS                      *fugitive-object* *fugitive-revision*
 
 Fugitive objects are either work tree files or Git revisions as defined in the
